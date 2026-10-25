@@ -316,7 +316,8 @@ pub async fn exchange_code(
         return Err(err);
     }
 
-    let user_info = client.user_info(token_response.access_token().to_owned()).await?;
+    let user_info =
+        client.user_info(token_response.access_token().to_owned(), Some(id_claims.subject().clone())).await?;
 
     let email = match id_claims.email().or(user_info.email()) {
         None => err!("Neither id token nor userinfo contained an email"),
