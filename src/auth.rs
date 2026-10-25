@@ -17,7 +17,7 @@ use ipnet::IpNet;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, errors::ErrorKind};
 use num_traits::FromPrimitive;
 use openssl::rsa::Rsa;
-use ring::hmac;
+use ring::{aead, hmac};
 use serde::{de::DeserializeOwned, ser::Serialize};
 
 use rocket::{
@@ -70,6 +70,7 @@ static JWT_2FA_REMEMBER_ISSUER: LazyLock<String> = LazyLock::new(|| format!("{}|
 static PRIVATE_RSA_KEY: OnceLock<EncodingKey> = OnceLock::new();
 static PUBLIC_RSA_KEY: OnceLock<DecodingKey> = OnceLock::new();
 static PRELOGIN_KDF_KEY: OnceLock<hmac::Key> = OnceLock::new();
+static SSO_TOKEN_KEY: OnceLock<aead::LessSafeKey> = OnceLock::new();
 
 pub async fn initialize_keys() -> Result<(), Error> {
     use std::io::Error as IoError;
@@ -109,6 +110,14 @@ pub async fn initialize_keys() -> Result<(), Error> {
     let prelogin_kdf_key = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &priv_key_buffer), b"prelogin-kdf");
     if PRELOGIN_KDF_KEY.set(hmac::Key::new(hmac::HMAC_SHA256, prelogin_kdf_key.as_ref())).is_err() {
         err!("PRELOGIN_KDF_KEY must only be initialized once")
+    }
+
+    // Derived from the RSA key, so it stays the same across restarts without storing another secret
+    let sso_token_key = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, &priv_key_buffer), b"sso-token-enc");
+    let sso_token_key = aead::UnboundKey::new(&aead::AES_256_GCM, sso_token_key.as_ref())
+        .expect("HMAC-SHA256 output is a valid AES-256-GCM key");
+    if SSO_TOKEN_KEY.set(aead::LessSafeKey::new(sso_token_key)).is_err() {
+        err!("SSO_TOKEN_KEY must only be initialized once")
     }
     Ok(())
 }
@@ -1290,6 +1299,61 @@ pub enum TokenWrapper {
     Refresh(String),
 }
 
+// The refresh JWT is signed but readable by the client, so the SSO token is sealed inside it
+mod sealed_token {
+    use data_encoding::BASE64URL_NOPAD;
+    use ring::aead;
+    use serde::{Deserialize, Deserializer, Serializer, de::Error as _, ser::Error as _};
+
+    use super::{SSO_TOKEN_KEY, TokenWrapper};
+    use crate::crypto;
+
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Stored {
+        Sealed(String),
+        // Refresh JWTs issued before sealing carry the plaintext token, accept them until the next refresh re-issues one
+        Legacy(TokenWrapper),
+    }
+
+    // serde's `with` passes `&Option<T>`, so the signature can't take `Option<&T>`
+    #[allow(clippy::ref_option)]
+    pub fn serialize<S: Serializer>(token: &Option<TokenWrapper>, s: S) -> Result<S::Ok, S::Error> {
+        let Some(token) = token else {
+            return s.serialize_none();
+        };
+        let nonce = crypto::get_random_bytes::<12>();
+        let mut sealed = serde_json::to_vec(token).map_err(S::Error::custom)?;
+        SSO_TOKEN_KEY
+            .wait()
+            .seal_in_place_append_tag(aead::Nonce::assume_unique_for_key(nonce), aead::Aad::empty(), &mut sealed)
+            .map_err(S::Error::custom)?;
+        let mut out = nonce.to_vec();
+        out.extend(sealed);
+        s.serialize_str(&BASE64URL_NOPAD.encode(&out))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<TokenWrapper>, D::Error> {
+        match Option::<Stored>::deserialize(d)? {
+            None => Ok(None),
+            Some(Stored::Legacy(token)) => Ok(Some(token)),
+            Some(Stored::Sealed(sealed)) => {
+                let bytes = BASE64URL_NOPAD.decode(sealed.as_bytes()).map_err(D::Error::custom)?;
+                let Some((nonce, ciphertext)) = bytes.split_at_checked(12) else {
+                    return Err(D::Error::custom("Invalid sealed token"));
+                };
+                let nonce = aead::Nonce::try_assume_unique_for_key(nonce).map_err(D::Error::custom)?;
+                let mut buf = ciphertext.to_vec();
+                let plain = SSO_TOKEN_KEY
+                    .wait()
+                    .open_in_place(nonce, aead::Aad::empty(), &mut buf)
+                    .map_err(D::Error::custom)?;
+                serde_json::from_slice(plain).map(Some).map_err(D::Error::custom)
+            }
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RefreshJwtClaims {
     // Not before
@@ -1303,6 +1367,7 @@ pub struct RefreshJwtClaims {
 
     pub device_token: String,
 
+    #[serde(default, with = "sealed_token")]
     pub token: Option<TokenWrapper>,
 }
 
@@ -1402,6 +1467,87 @@ pub async fn refresh_tokens(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn init_sso_token_key() {
+        let key = aead::UnboundKey::new(&aead::AES_256_GCM, &[7u8; 32]).unwrap();
+        let _ = SSO_TOKEN_KEY.set(aead::LessSafeKey::new(key));
+    }
+
+    fn refresh_claims(token: Option<TokenWrapper>) -> RefreshJwtClaims {
+        RefreshJwtClaims {
+            nbf: 0,
+            exp: 0,
+            iss: String::new(),
+            sub: AuthMethod::Sso,
+            device_token: "device".to_owned(),
+            token,
+        }
+    }
+
+    #[test]
+    fn sso_token_round_trip() {
+        init_sso_token_key();
+        let json =
+            serde_json::to_string(&refresh_claims(Some(TokenWrapper::Refresh("secret-refresh".into())))).unwrap();
+        assert!(!json.contains("secret-refresh"));
+        match serde_json::from_str::<RefreshJwtClaims>(&json).unwrap().token {
+            Some(TokenWrapper::Refresh(t)) => assert_eq!(t, "secret-refresh"),
+            other => panic!("unexpected token {other:?}"),
+        }
+
+        let json = serde_json::to_string(&refresh_claims(Some(TokenWrapper::Access("secret-access".into())))).unwrap();
+        assert!(!json.contains("secret-access"));
+        match serde_json::from_str::<RefreshJwtClaims>(&json).unwrap().token {
+            Some(TokenWrapper::Access(t)) => assert_eq!(t, "secret-access"),
+            other => panic!("unexpected token {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sso_token_is_sealed_with_random_nonce() {
+        init_sso_token_key();
+        let claims = refresh_claims(Some(TokenWrapper::Refresh("secret-refresh".into())));
+        let first = serde_json::to_string(&claims).unwrap();
+        let second = serde_json::to_string(&claims).unwrap();
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn sso_token_none_round_trip() {
+        init_sso_token_key();
+        let json = serde_json::to_string(&refresh_claims(None)).unwrap();
+        assert!(serde_json::from_str::<RefreshJwtClaims>(&json).unwrap().token.is_none());
+    }
+
+    #[test]
+    fn sso_token_accepts_legacy_plaintext() {
+        init_sso_token_key();
+        let json = r#"{"nbf":0,"exp":0,"iss":"","sub":"sso","device_token":"device","token":{"Refresh":"legacy"}}"#;
+        match serde_json::from_str::<RefreshJwtClaims>(json).unwrap().token {
+            Some(TokenWrapper::Refresh(t)) => assert_eq!(t, "legacy"),
+            other => panic!("unexpected token {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sso_token_rejects_tampered_or_garbage() {
+        init_sso_token_key();
+        let json =
+            serde_json::to_string(&refresh_claims(Some(TokenWrapper::Refresh("secret-refresh".into())))).unwrap();
+        let start = json.find("\"token\":\"").unwrap() + "\"token\":\"".len();
+        let first = json[start..].chars().next().unwrap();
+        let flipped = if first == 'A' {
+            'B'
+        } else {
+            'A'
+        };
+        let mut tampered = json.clone();
+        tampered.replace_range(start..start + 1, &flipped.to_string());
+        assert!(serde_json::from_str::<RefreshJwtClaims>(&tampered).is_err());
+
+        let garbage = r#"{"nbf":0,"exp":0,"iss":"","sub":"sso","device_token":"device","token":"AAAA"}"#;
+        assert!(serde_json::from_str::<RefreshJwtClaims>(garbage).is_err());
+    }
 
     fn client_ip(values: &[&str]) -> Option<IpAddr> {
         let is_trusted = |ip: IpAddr| match ip {
