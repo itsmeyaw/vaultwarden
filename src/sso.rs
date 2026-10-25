@@ -252,6 +252,21 @@ fn check_hosted_domain(hd: Option<&str>, allowed: Option<&str>) -> EmptyResult {
     }
 }
 
+// Google is only authoritative for `@gmail.com` and Workspace (`hd`) addresses, see
+// https://developers.google.com/identity/gsi/web/guides/verify-google-id-token
+fn authoritative_email_verified(
+    issuer: &str,
+    email: &str,
+    hd: Option<&str>,
+    email_verified: Option<bool>,
+) -> Option<bool> {
+    let is_google = matches!(issuer, "https://accounts.google.com" | "accounts.google.com");
+    if is_google && !email.ends_with("@gmail.com") && hd.is_none_or(str::is_empty) {
+        return Some(false);
+    }
+    email_verified
+}
+
 // During the 2FA flow we will
 //  - retrieve the user information and then only discover he needs 2FA.
 //  - second time we will rely on `SsoAuth.auth_response` since the `code` has already been exchanged,
@@ -308,7 +323,12 @@ pub async fn exchange_code(
         Some(e) => e.to_string().to_lowercase(),
     };
 
-    let email_verified = id_claims.email_verified().or(user_info.email_verified());
+    let email_verified = authoritative_email_verified(
+        id_claims.issuer().as_str(),
+        &email,
+        id_claims.additional_claims().hd.as_deref(),
+        id_claims.email_verified().or(user_info.email_verified()),
+    );
 
     let user_name = id_claims.preferred_username().or(user_info.preferred_username()).map(|un| un.to_string());
 
@@ -496,7 +516,50 @@ pub async fn exchange_refresh_token(
 
 #[cfg(test)]
 mod tests {
-    use super::check_hosted_domain;
+    use super::{authoritative_email_verified, check_hosted_domain};
+
+    const GOOGLE: &str = "https://accounts.google.com";
+
+    #[test]
+    fn google_consumer_email_verified_is_kept_for_gmail() {
+        assert_eq!(authoritative_email_verified(GOOGLE, "alice@gmail.com", None, Some(true)), Some(true));
+    }
+
+    #[test]
+    fn google_custom_domain_with_hd_keeps_email_verified() {
+        assert_eq!(
+            authoritative_email_verified(GOOGLE, "alice@yourcorp.com", Some("yourcorp.com"), Some(true)),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn google_custom_domain_without_hd_is_not_verified() {
+        assert_eq!(authoritative_email_verified(GOOGLE, "alice@yourcorp.com", None, Some(true)), Some(false));
+        assert_eq!(authoritative_email_verified(GOOGLE, "alice@yourcorp.com", None, None), Some(false));
+        assert_eq!(authoritative_email_verified(GOOGLE, "alice@yourcorp.com", Some(""), Some(true)), Some(false));
+    }
+
+    #[test]
+    fn google_bare_issuer_behaves_like_https_issuer() {
+        assert_eq!(
+            authoritative_email_verified("accounts.google.com", "alice@yourcorp.com", None, Some(true)),
+            Some(false)
+        );
+        assert_eq!(
+            authoritative_email_verified("accounts.google.com", "alice@gmail.com", None, Some(true)),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn non_google_issuer_is_untouched() {
+        assert_eq!(
+            authoritative_email_verified("https://sso.example.com", "alice@yourcorp.com", None, Some(true)),
+            Some(true)
+        );
+        assert_eq!(authoritative_email_verified("https://sso.example.com", "alice@yourcorp.com", None, None), None);
+    }
 
     #[test]
     fn hosted_domain_unset_allows_any_claim() {
