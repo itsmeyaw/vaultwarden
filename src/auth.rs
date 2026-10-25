@@ -1325,7 +1325,8 @@ mod sealed_token {
         let nonce = crypto::get_random_bytes::<12>();
         let mut sealed = serde_json::to_vec(token).map_err(S::Error::custom)?;
         SSO_TOKEN_KEY
-            .wait()
+            .get()
+            .ok_or_else(|| S::Error::custom("SSO token key not initialized"))?
             .seal_in_place_append_tag(aead::Nonce::assume_unique_for_key(nonce), aead::Aad::empty(), &mut sealed)
             .map_err(S::Error::custom)?;
         let mut out = nonce.to_vec();
@@ -1345,7 +1346,8 @@ mod sealed_token {
                 let nonce = aead::Nonce::try_assume_unique_for_key(nonce).map_err(D::Error::custom)?;
                 let mut buf = ciphertext.to_vec();
                 let plain = SSO_TOKEN_KEY
-                    .wait()
+                    .get()
+                    .ok_or_else(|| D::Error::custom("SSO token key not initialized"))?
                     .open_in_place(nonce, aead::Aad::empty(), &mut buf)
                     .map_err(D::Error::custom)?;
                 serde_json::from_slice(plain).map(Some).map_err(D::Error::custom)
@@ -1544,6 +1546,17 @@ mod tests {
         let mut tampered = json.clone();
         tampered.replace_range(start..start + 1, &flipped.to_string());
         assert!(serde_json::from_str::<RefreshJwtClaims>(&tampered).is_err());
+
+        // Flip a bit in the last byte of the GCM tag
+        let claims = refresh_claims(Some(TokenWrapper::Refresh("secret-refresh".into())));
+        let serde_json::Value::String(sealed) = serde_json::to_value(&claims).unwrap()["token"].clone() else {
+            panic!("token is not sealed");
+        };
+        let mut bytes = data_encoding::BASE64URL_NOPAD.decode(sealed.as_bytes()).unwrap();
+        *bytes.last_mut().unwrap() ^= 1;
+        let mut value = serde_json::to_value(&claims).unwrap();
+        value["token"] = data_encoding::BASE64URL_NOPAD.encode(&bytes).into();
+        assert!(serde_json::from_value::<RefreshJwtClaims>(value).is_err());
 
         let garbage = r#"{"nbf":0,"exp":0,"iss":"","sub":"sso","device_token":"device","token":"AAAA"}"#;
         assert!(serde_json::from_str::<RefreshJwtClaims>(garbage).is_err());
