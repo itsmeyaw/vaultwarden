@@ -241,14 +241,13 @@ impl OIDCIdentifier {
 }
 
 fn check_hosted_domain(hd: Option<&str>, allowed: Option<&str>) -> EmptyResult {
-    let allowed: Vec<&str> =
-        allowed.unwrap_or_default().split(',').map(str::trim).filter(|domain| !domain.is_empty()).collect();
-    if allowed.is_empty() {
+    let Some(allowed) = allowed.map(str::trim).filter(|allowed| !allowed.is_empty()) else {
         return Ok(());
-    }
+    };
 
+    // Fails closed: a set but degenerate list (e.g. " , ") matches nothing.
     match hd {
-        Some(hd) if allowed.iter().any(|domain| domain.eq_ignore_ascii_case(hd)) => Ok(()),
+        Some(hd) if allowed.split(',').map(str::trim).any(|d| !d.is_empty() && d.eq_ignore_ascii_case(hd)) => Ok(()),
         _ => err!("Account is not part of an allowed hosted domain"),
     }
 }
@@ -503,12 +502,19 @@ mod tests {
     fn hosted_domain_unset_allows_any_claim() {
         assert!(check_hosted_domain(None, None).is_ok());
         assert!(check_hosted_domain(Some("other.org"), None).is_ok());
-        assert!(check_hosted_domain(None, Some(" , ")).is_ok());
+        assert!(check_hosted_domain(None, Some("  ")).is_ok());
     }
 
     #[test]
     fn hosted_domain_missing_claim_is_rejected() {
         assert!(check_hosted_domain(None, Some("example.com")).is_err());
+    }
+
+    #[test]
+    fn hosted_domain_degenerate_list_rejects_all() {
+        assert!(check_hosted_domain(None, Some(" , ")).is_err());
+        assert!(check_hosted_domain(Some(""), Some(" , ")).is_err());
+        assert!(check_hosted_domain(Some("example.com"), Some(" , ")).is_err());
     }
 
     #[test]
