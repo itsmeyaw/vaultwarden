@@ -21,7 +21,7 @@ defaults:
 jobs:
   ghcr:
     name: Build and push amd64 image
-    if: ${{ github.repository == 'itsmeyaw/vaultwarden' }}
+    if: ${{ github.repository == 'itsmeyaw/vaultwarden' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
