@@ -1,16 +1,16 @@
 use std::{borrow::Cow, collections::HashSet, future::Future, pin::Pin, sync::LazyLock, time::Duration};
 
 use openidconnect::{
-    AccessToken, AsyncHttpClient, AuthDisplay, AuthPrompt, AuthType, AuthenticationFlow, AuthorizationCode,
-    AuthorizationRequest, ClientId, ClientSecret, CsrfToken, EmptyAdditionalClaims, EmptyExtraTokenFields,
-    EndpointNotSet, EndpointSet, HttpClientError, HttpRequest, HttpResponse, IdTokenClaims, IdTokenFields, Nonce,
-    OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, RefreshToken, ResponseType, Scope, StandardErrorResponse,
+    AccessToken, AdditionalClaims, AsyncHttpClient, AuthDisplay, AuthPrompt, AuthType, AuthenticationFlow,
+    AuthorizationCode, AuthorizationRequest, ClientId, ClientSecret, CsrfToken, EmptyExtraTokenFields, EndpointNotSet,
+    EndpointSet, HttpClientError, HttpRequest, HttpResponse, IdTokenClaims, IdTokenFields, Nonce, OAuth2TokenResponse,
+    PkceCodeChallenge, PkceCodeVerifier, RefreshToken, ResponseType, Scope, StandardErrorResponse,
     StandardTokenResponse,
     core::{
-        CoreAuthDisplay, CoreAuthPrompt, CoreClient, CoreClientAuthMethod, CoreErrorResponseType, CoreGenderClaim,
+        CoreAuthDisplay, CoreAuthPrompt, CoreClientAuthMethod, CoreErrorResponseType, CoreGenderClaim,
         CoreIdTokenVerifier, CoreJsonWebKey, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm,
         CoreProviderMetadata, CoreResponseType, CoreRevocableToken, CoreRevocationErrorResponse,
-        CoreTokenIntrospectionResponse, CoreTokenResponse, CoreTokenType, CoreUserInfoClaims,
+        CoreTokenIntrospectionResponse, CoreTokenType, CoreUserInfoClaims,
     },
     http, url,
 };
@@ -35,26 +35,56 @@ static CLIENT_CACHE: LazyLock<moka::sync::Cache<String, Client>> = LazyLock::new
 static REFRESH_CACHE: LazyLock<moka::future::Cache<String, Result<RefreshTokenResponse, String>>> =
     LazyLock::new(|| moka::future::Cache::builder().max_capacity(1000).time_to_live(Duration::from_secs(30)).build());
 
-/// OpenID Connect Core client.
-pub type CustomClient = openidconnect::Client<
-    EmptyAdditionalClaims,
+/// Additional ID token claims, `hd` is the Google Workspace hosted domain
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct VwAdditionalClaims {
+    pub hd: Option<String>,
+}
+
+impl AdditionalClaims for VwAdditionalClaims {}
+
+pub type VwTokenResponse = StandardTokenResponse<
+    IdTokenFields<
+        VwAdditionalClaims,
+        EmptyExtraTokenFields,
+        CoreGenderClaim,
+        CoreJweContentEncryptionAlgorithm,
+        CoreJwsSigningAlgorithm,
+    >,
+    CoreTokenType,
+>;
+
+/// OpenID Connect Core client with the additional claims.
+pub type VwCoreClient<
+    HasAuthUrl = EndpointNotSet,
+    HasDeviceAuthUrl = EndpointNotSet,
+    HasIntrospectionUrl = EndpointNotSet,
+    HasRevocationUrl = EndpointNotSet,
+    HasTokenUrl = EndpointNotSet,
+    HasUserInfoUrl = EndpointNotSet,
+> = openidconnect::Client<
+    VwAdditionalClaims,
     CoreAuthDisplay,
     CoreGenderClaim,
     CoreJweContentEncryptionAlgorithm,
     CoreJsonWebKey,
     CoreAuthPrompt,
     StandardErrorResponse<CoreErrorResponseType>,
-    CoreTokenResponse,
+    VwTokenResponse,
     CoreTokenIntrospectionResponse,
     CoreRevocableToken,
     CoreRevocationErrorResponse,
-    EndpointSet,
-    EndpointNotSet,
-    EndpointNotSet,
-    EndpointNotSet,
-    EndpointSet,
-    EndpointSet,
+    HasAuthUrl,
+    HasDeviceAuthUrl,
+    HasIntrospectionUrl,
+    HasRevocationUrl,
+    HasTokenUrl,
+    HasUserInfoUrl,
 >;
+
+/// OpenID Connect Core client.
+pub type CustomClient =
+    VwCoreClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet, EndpointSet>;
 
 pub type RefreshTokenResponse = (Option<String>, String, Option<Duration>);
 
@@ -125,7 +155,7 @@ impl Client {
             .token_endpoint_auth_methods_supported()
             .map(|v| v.iter().map(ToOwned::to_owned).collect());
 
-        let mut base_client = CoreClient::from_provider_metadata(provider_metadata, client_id, Some(client_secret));
+        let mut base_client = VwCoreClient::from_provider_metadata(provider_metadata, client_id, Some(client_secret));
 
         if let Some(am) = auth_methods {
             if am.contains(&CoreClientAuthMethod::ClientSecretBasic) {
@@ -227,19 +257,7 @@ impl Client {
         code: OIDCCode,
         client_verifier: OIDCCodeVerifier,
         sso_auth: &SsoAuth,
-    ) -> ApiResult<(
-        StandardTokenResponse<
-            IdTokenFields<
-                EmptyAdditionalClaims,
-                EmptyExtraTokenFields,
-                CoreGenderClaim,
-                CoreJweContentEncryptionAlgorithm,
-                CoreJwsSigningAlgorithm,
-            >,
-            CoreTokenType,
-        >,
-        IdTokenClaims<EmptyAdditionalClaims, CoreGenderClaim>,
-    )> {
+    ) -> ApiResult<(VwTokenResponse, IdTokenClaims<VwAdditionalClaims, CoreGenderClaim>)> {
         let oidc_code = AuthorizationCode::new(code.to_string());
 
         let mut exchange = self.core_client.exchange_code(oidc_code);
@@ -349,5 +367,22 @@ impl<'a, AD: AuthDisplay, P: AuthPrompt, RT: ResponseType> AuthorizationRequestE
             self = self.add_extra_param(key, value);
         }
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::VwAdditionalClaims;
+
+    #[test]
+    fn additional_claims_reads_hd() {
+        let claims: VwAdditionalClaims = serde_json::from_str(r#"{"hd":"example.com"}"#).unwrap();
+        assert_eq!(claims.hd.as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn additional_claims_hd_defaults_to_none() {
+        let claims: VwAdditionalClaims = serde_json::from_str("{}").unwrap();
+        assert_eq!(claims.hd, None);
     }
 }

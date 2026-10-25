@@ -6,7 +6,7 @@ use url::Url;
 
 use crate::{
     CONFIG,
-    api::ApiResult,
+    api::{ApiResult, EmptyResult},
     auth,
     auth::{AuthMethod, AuthTokens, BW_EXPIRATION, DEFAULT_REFRESH_VALIDITY, TokenWrapper},
     db::{
@@ -240,6 +240,18 @@ impl OIDCIdentifier {
     }
 }
 
+fn check_hosted_domain(hd: Option<&str>, allowed: Option<&str>) -> EmptyResult {
+    let Some(allowed) = allowed.map(str::trim).filter(|allowed| !allowed.is_empty()) else {
+        return Ok(());
+    };
+
+    // Fails closed: a set but degenerate list (e.g. " , ") matches nothing.
+    match hd {
+        Some(hd) if allowed.split(',').map(str::trim).any(|d| !d.is_empty() && d.eq_ignore_ascii_case(hd)) => Ok(()),
+        _ => err!("Account is not part of an allowed hosted domain"),
+    }
+}
+
 // During the 2FA flow we will
 //  - retrieve the user information and then only discover he needs 2FA.
 //  - second time we will rely on `SsoAuth.auth_response` since the `code` has already been exchanged,
@@ -280,6 +292,14 @@ pub async fn exchange_code(
 
     let client = Client::cached().await?;
     let (token_response, id_claims) = client.exchange_code(code, client_verifier, &sso_auth).await?;
+
+    let allowed_hosted_domains = CONFIG.sso_allowed_hosted_domains();
+    if let Err(err) =
+        check_hosted_domain(id_claims.additional_claims().hd.as_deref(), allowed_hosted_domains.as_deref())
+    {
+        sso_auth.delete(conn).await?;
+        return Err(err);
+    }
 
     let user_info = client.user_info(token_response.access_token().to_owned()).await?;
 
@@ -471,5 +491,39 @@ pub async fn exchange_refresh_token(
             create_auth_tokens_impl(device, None, access_claims, access_token)
         }
         None => err!("No token present while in SSO"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_hosted_domain;
+
+    #[test]
+    fn hosted_domain_unset_allows_any_claim() {
+        assert!(check_hosted_domain(None, None).is_ok());
+        assert!(check_hosted_domain(Some("other.org"), None).is_ok());
+        assert!(check_hosted_domain(None, Some("  ")).is_ok());
+    }
+
+    #[test]
+    fn hosted_domain_missing_claim_is_rejected() {
+        assert!(check_hosted_domain(None, Some("example.com")).is_err());
+    }
+
+    #[test]
+    fn hosted_domain_degenerate_list_rejects_all() {
+        assert!(check_hosted_domain(None, Some(" , ")).is_err());
+        assert!(check_hosted_domain(Some(""), Some(" , ")).is_err());
+        assert!(check_hosted_domain(Some("example.com"), Some(" , ")).is_err());
+    }
+
+    #[test]
+    fn hosted_domain_not_in_list_is_rejected() {
+        assert!(check_hosted_domain(Some("other.org"), Some("example.com,example.org")).is_err());
+    }
+
+    #[test]
+    fn hosted_domain_match_ignores_case_and_whitespace() {
+        assert!(check_hosted_domain(Some("Example.ORG"), Some(" example.com , example.org ")).is_ok());
     }
 }

@@ -854,6 +854,8 @@ make_config! {
         sso_pkce:                       bool,   true,   def,    true;
         /// Regex for additional trusted Id token audience |> By default only the client_id is trusted.
         sso_audience_trusted:           String, true,  option;
+        /// Allowed Google hosted domains |> Comma-separated list of Google Workspace domains matched against the `hd` ID token claim. When set, every SSO login without a matching `hd` claim is rejected, so only set it when Google is the provider. Applies to new logins, not existing sessions.
+        sso_allowed_hosted_domains:     String, true,  option;
         /// CallBack Path |> Generated from Domain.
         sso_callback_path:              String, true,  generated, |c| generate_sso_callback_path(&c.domain);
         /// Optional SSO master password policy |> Ex format: '{"enforceOnLogin":false,"minComplexity":3,"minLength":12,"requireLower":false,"requireNumbers":false,"requireSpecial":false,"requireUpper":false}'
@@ -1135,6 +1137,13 @@ fn validate_config(cfg: &ConfigItems, on_update: bool) -> Result<(), Error> {
         validate_internal_sso_issuer_url(&cfg.sso_authority)?;
         validate_internal_sso_redirect_url(&cfg.sso_callback_path)?;
         validate_sso_master_password_policy(cfg.sso_master_password_policy.as_ref())?;
+
+        if let Some(domains) = cfg.sso_allowed_hosted_domains.as_deref().map(str::trim)
+            && !domains.is_empty()
+            && domains.split(',').any(|d| d.trim().is_empty())
+        {
+            err!("`SSO_ALLOWED_HOSTED_DOMAINS` contains empty tokens");
+        }
     }
 
     if cfg._enable_yubico {
