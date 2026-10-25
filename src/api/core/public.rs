@@ -47,7 +47,7 @@ struct OrgImportData {
     groups: Vec<OrgImportGroupData>,
     members: Vec<OrgImportUserData>,
     overwrite_existing: bool,
-    // largeImport is not enforced: upstream uses it to allow syncs of more than 2000 users or groups.
+    // Only used to skip group pruning; upstream's 2000 users/groups limit is not enforced.
     #[serde(default)]
     large_import: bool,
 }
