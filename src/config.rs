@@ -854,6 +854,8 @@ make_config! {
         sso_pkce:                       bool,   true,   def,    true;
         /// Regex for additional trusted Id token audience |> By default only the client_id is trusted.
         sso_audience_trusted:           String, true,  option;
+        /// Allowed Google hosted domains |> Comma-separated list of Google Workspace domains matched against the `hd` claim. When set, logins without a matching `hd` claim are rejected.
+        sso_allowed_hosted_domains:     String, true,  option;
         /// CallBack Path |> Generated from Domain.
         sso_callback_path:              String, true,  generated, |c| generate_sso_callback_path(&c.domain);
         /// Optional SSO master password policy |> Ex format: '{"enforceOnLogin":false,"minComplexity":3,"minLength":12,"requireLower":false,"requireNumbers":false,"requireSpecial":false,"requireUpper":false}'
