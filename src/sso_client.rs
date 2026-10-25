@@ -5,7 +5,7 @@ use openidconnect::{
     AuthorizationCode, AuthorizationRequest, ClientId, ClientSecret, CsrfToken, EmptyExtraTokenFields, EndpointNotSet,
     EndpointSet, HttpClientError, HttpRequest, HttpResponse, IdTokenClaims, IdTokenFields, Nonce, OAuth2TokenResponse,
     PkceCodeChallenge, PkceCodeVerifier, RefreshToken, ResponseType, Scope, StandardErrorResponse,
-    StandardTokenResponse,
+    StandardTokenResponse, SubjectIdentifier,
     core::{
         CoreAuthDisplay, CoreAuthPrompt, CoreClientAuthMethod, CoreErrorResponseType, CoreGenderClaim,
         CoreIdTokenVerifier, CoreJsonWebKey, CoreJweContentEncryptionAlgorithm, CoreJwsSigningAlgorithm,
@@ -297,8 +297,12 @@ impl Client {
         }
     }
 
-    pub async fn user_info(&self, access_token: AccessToken) -> ApiResult<CoreUserInfoClaims> {
-        match self.core_client.user_info(access_token, None).request_async(&self.http_client).await {
+    pub async fn user_info(
+        &self,
+        access_token: AccessToken,
+        expected_subject: Option<SubjectIdentifier>,
+    ) -> ApiResult<CoreUserInfoClaims> {
+        match self.core_client.user_info(access_token, expected_subject).request_async(&self.http_client).await {
             Err(err) => err!(format!("Request to user_info endpoint failed: {err}")),
             Ok(user_info) => Ok(user_info),
         }
@@ -306,7 +310,8 @@ impl Client {
 
     pub async fn check_validity(access_token: String) -> EmptyResult {
         let client = Client::cached().await?;
-        match client.user_info(AccessToken::new(access_token)).await {
+        // Only checks token liveness, the claims are not used
+        match client.user_info(AccessToken::new(access_token), None).await {
             Err(err) => {
                 err_silent!(format!("Failed to retrieve user info, token has probably been invalidated: {err}"))
             }
@@ -372,7 +377,15 @@ impl<'a, AD: AuthDisplay, P: AuthPrompt, RT: ResponseType> AuthorizationRequestE
 
 #[cfg(test)]
 mod tests {
-    use super::VwAdditionalClaims;
+    use super::{CoreUserInfoClaims, SubjectIdentifier, VwAdditionalClaims};
+
+    #[test]
+    fn user_info_rejects_mismatched_subject() {
+        let expected = SubjectIdentifier::new("id-token-sub".to_owned());
+        let parse = |json: &str| CoreUserInfoClaims::from_json::<std::io::Error>(json.as_bytes(), Some(&expected));
+        assert!(parse(r#"{"sub":"other-sub"}"#).is_err());
+        assert!(parse(r#"{"sub":"id-token-sub"}"#).is_ok());
+    }
 
     #[test]
     fn additional_claims_reads_hd() {
