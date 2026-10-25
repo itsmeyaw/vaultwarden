@@ -47,7 +47,19 @@ struct OrgImportData {
     groups: Vec<OrgImportGroupData>,
     members: Vec<OrgImportUserData>,
     overwrite_existing: bool,
-    // largeImport: bool, // For now this will not be used, upstream uses this to prevent syncs of more then 2000 users or groups without the flag set.
+    // largeImport is not enforced: upstream uses it to allow syncs of more than 2000 users or groups.
+    #[serde(default)]
+    large_import: bool,
+}
+
+// A group that came from the directory (has an external_id) but is no longer in the import is stale.
+fn is_stale_import_group(group_external_id: Option<&str>, imported_ext_ids: &HashSet<&str>) -> bool {
+    group_external_id.is_some_and(|id| !imported_ext_ids.contains(id))
+}
+
+// Directory Connector sends no groups when group sync is off, and splits large imports across requests.
+fn should_prune_groups(data: &OrgImportData) -> bool {
+    !data.groups.is_empty() && !data.large_import
 }
 
 #[post("/public/organization/import", data = "<data>")]
@@ -161,6 +173,15 @@ async fn ldap_import(data: Json<OrgImportData>, token: PublicToken, conn: DbConn
                 }
             }
         }
+
+        if should_prune_groups(&data) {
+            let imported_ext_ids: HashSet<&str> = data.groups.iter().map(|g| g.external_id.as_str()).collect();
+            for group in Group::find_by_organization(&org_id, &conn).await {
+                if is_stale_import_group(group.external_id.as_deref(), &imported_ext_ids) {
+                    group.delete(&org_id, &conn).await?;
+                }
+            }
+        }
     } else {
         warn!("Group support is disabled, groups will not be imported!");
     }
@@ -238,5 +259,63 @@ impl<'r> FromRequest<'r> for PublicToken {
         }
 
         Outcome::Success(PublicToken(claims.client_sub))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn import_data(extra: serde_json::Value) -> OrgImportData {
+        let mut data = json!({
+            "groups": [{"name": "Group", "externalId": "ext-1", "memberExternalIds": []}],
+            "members": [],
+            "overwriteExisting": false
+        });
+        data.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        serde_json::from_value(data).unwrap()
+    }
+
+    #[test]
+    fn group_missing_from_import_is_stale() {
+        let imported = HashSet::from(["ext-1"]);
+        assert!(is_stale_import_group(Some("ext-2"), &imported));
+    }
+
+    #[test]
+    fn group_present_in_import_is_not_stale() {
+        let imported = HashSet::from(["ext-1"]);
+        assert!(!is_stale_import_group(Some("ext-1"), &imported));
+    }
+
+    #[test]
+    fn manual_group_without_external_id_is_not_stale() {
+        let imported = HashSet::from(["ext-1"]);
+        assert!(!is_stale_import_group(None, &imported));
+    }
+
+    #[test]
+    fn prune_allowed_for_regular_import() {
+        assert!(should_prune_groups(&import_data(json!({}))));
+    }
+
+    #[test]
+    fn prune_skipped_when_payload_has_no_groups() {
+        assert!(!should_prune_groups(&import_data(json!({"groups": []}))));
+    }
+
+    #[test]
+    fn prune_skipped_for_large_import() {
+        assert!(!should_prune_groups(&import_data(json!({"largeImport": true}))));
+    }
+
+    #[test]
+    fn large_import_defaults_to_false() {
+        assert!(!import_data(json!({})).large_import);
+    }
+
+    #[test]
+    fn large_import_deserializes_when_set() {
+        assert!(import_data(json!({"largeImport": true})).large_import);
     }
 }
